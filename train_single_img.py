@@ -12,7 +12,7 @@ import numpy as np
 from utils.loss import FocalLoss
 from data.data_sets import get_my_data
 import math
-from torch.optim.lr_scheduler import LambdaLR
+# from torch.optim.lr_scheduler import LambdaLR
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
@@ -37,11 +37,13 @@ def setup_logging(log_dir):
 
 # 评估函数
 def evaluate(model, dataloader, criterion, device):
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
-    
+ 
     with torch.no_grad():
         for batch in dataloader:
             # 数据加载适配不同数据格式
@@ -101,7 +103,12 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减系数')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup阶段epoch数')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='最小学习率')
-    
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training')
+    parser.add_argument('--val_interval', type=int, default=1,help='Validation interval in epochs')
+    parser.add_argument('--save_interval', type=int, default=1,help='保存最新检查点的间隔epoch数')
+    parser.add_argument('--early_stop', action='store_true',help='启用早停机制')
+    parser.add_argument('--patience', type=int, default=10,help='早停等待epoch数')
+    parser.add_argument('--amp', action='store_true',help='启用混合精度训练')
     
     # 系统参数
     # parser.add_argument('--log_dir', type=str, default='./logs')
@@ -160,6 +167,37 @@ class Trainer:
             'val_acc': []
         }
 
+        # 恢复训练逻辑
+        self.start_epoch = 0
+        if args.resume:
+            self._resume_checkpoint(args.resume)
+
+        # 混合精度训练
+        self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+        
+        # 早停机制
+        self.early_stop = args.early_stop
+        self.patience = args.patience
+        self.best_loss = float('inf')
+        self.no_improve_epochs = 0
+
+    def _resume_checkpoint(self, checkpoint_path):
+        """从检查点恢复训练状态"""
+        logging.info(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.start_epoch = checkpoint['epoch']
+        self.best_acc = checkpoint['best_acc']
+
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
+        self.no_improve_epochs = checkpoint.get('no_improve_epochs', 0)
+        
+        logging.info(f"Resumed training from epoch {self.start_epoch}")
+        logging.info(f"Previous best accuracy: {self.best_acc:.4f}")
+
     def _create_scheduler(self, args):
         """创建包含warmup和余弦退火的学习率调度器"""
         def lr_lambda(current_epoch):
@@ -170,7 +208,8 @@ class Trainer:
             progress = (current_epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)
             return 0.5 * (1 + math.cos(math.pi * progress)) * (1 - args.min_lr / args.lr) + args.min_lr / args.lr
 
-        return LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        # return LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        return max(args.min_lr, 0.5 * args.lr * (1 + math.cos(math.pi * progress)))
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -186,72 +225,137 @@ class Trainer:
             
             # 前向传播
             self.optimizer.zero_grad()
-            outputs = self.model(ct, dose, structure)
-            loss = self.criterion(outputs, labels)
+
+            # 混合精度训练
+            with torch.cuda.amp.autocast(enabled=self.args.amp):
+                outputs = self.model(ct, dose, structure)
+                loss = self.criterion(outputs, labels)
             
             # 反向传播
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             
+
             # 统计信息
             epoch_loss += loss.item()
             if batch_idx % 2 == 0:
                 logging.info(f"Epoch {epoch+1} [{batch_idx}/{len(self.train_loader)}] Loss: {loss.item():.4f}")
+                current_lr = self.optimizer.param_groups[0]['lr']
+                grad_norm = sum(p.grad.norm()**2 for p in self.model.parameters() if p.grad is not None)**0.5
+                if self.args.amp:
+                    grad_norm = self.scaler.get_scale() * grad_norm  # 反缩放
+                logging.debug(f"LR: {current_lr:.2e} | Unscaled Grad Norm: {grad_norm:.4f}")
+            
         
         avg_loss = epoch_loss / len(self.train_loader)
         self.history['train_loss'].append(avg_loss)
         return avg_loss
 
     def run(self):
-        
-        for epoch in range(self.args.epochs):
+        # 修改训练循环范围
+        for epoch in range(self.start_epoch, self.args.epochs):
             # 训练阶段
             train_loss = self.train_epoch(epoch)
-
-            # 更新学习率
             self.scheduler.step()
-            
-            # 验证阶段
-            logging.info("开始验证...")
-            val_acc, val_loss = evaluate(self.model, self.val_loader, self.criterion, self.device)
-            self.history['val_acc'].append(val_acc)
-            self.history['val_loss'].append(val_loss)
 
-            # 记录当前学习率
-            current_lr = self.optimizer.param_groups[0]['lr']
-            logging.info(f"当前学习率: {current_lr:.2e}")
+            # 保存最新检查点（条件c）
+            if (epoch + 1) % self.args.save_interval == 0:
+                save_val_acc = self.history['val_acc'][-1] if self.history['val_acc'] else None
+                save_val_loss = self.history['val_loss'][-1] if self.history['val_loss'] else None
+                self._save_checkpoint(
+                    epoch=epoch+1,
+                    val_acc=save_val_acc,
+                    val_loss=save_val_loss,
+                    is_latest=True
+                )
 
-            # 日志记录
-            logging.info(f"Epoch {epoch+1}/{self.args.epochs} | "
-                        f"Train Loss: {train_loss:.4f} | "
-                        f"Val Loss: {val_loss:.4f} | "
-                        f"Val Acc: {val_acc:.4f} | "
-                        f"LR: {current_lr:.2e}")
 
-            # 保存检查点
-            is_best = val_acc > self.best_acc
-            if is_best:
-                self.best_acc = val_acc
+            # 验证和保存逻辑
+            if (epoch + 1) % self.args.val_interval == 0 or (epoch + 1) == self.args.epochs:
+                logging.info("开始验证...")
+                val_acc, val_loss = evaluate(self.model, self.val_loader, self.criterion, self.device)
+                self.history['val_acc'].append(val_acc)
+                self.history['val_loss'].append(val_loss)
+
+                # 记录当前学习率
+                current_lr = self.optimizer.param_groups[0]['lr']
+                logging.info(f"当前学习率: {current_lr:.2e}")
+
+                # 日志记录
+                logging.info(f"Epoch {epoch+1}/{self.args.epochs} | "
+                            f"Train Loss: {train_loss:.4f} | "
+                            f"Val Loss: {val_loss:.4f} | "
+                            f"Val Acc: {val_acc:.4f} | "
+                            f"LR: {current_lr:.2e}")
+                            
                 
-            checkpoint = {
-                'epoch': epoch + 1,
-                'state_dict': self.model.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_acc': self.best_acc,
-                'args': vars(self.args)
-            }
-
-            save_checkpoint(
-                checkpoint,
-                is_best,
-                self.args.checkpoint_dir,
-                filename=f"checkpoint_epoch{epoch+1}_val_acc{val_acc}.pth"
-            )
+                # 保存最佳模型（条件b）
+                is_best_acc = val_acc > self.best_acc
+                is_best_loss = val_loss < self.best_loss
+                
+                if is_best_acc or is_best_loss:
+                    tag = "acc" if is_best_acc else "loss"
+                    self._save_checkpoint(
+                        epoch=epoch+1,
+                        val_acc=val_acc,
+                        val_loss=val_loss,
+                        is_best=True,
+                        tag=tag
+                    )
+                    self.best_acc = max(self.best_acc, val_acc)
+                    self.best_loss = min(self.best_loss, val_loss)
+                    self.no_improve_epochs = 0
+                else:
+                    self.no_improve_epochs += 1
+                
+                # 早停判断
+                if self.early_stop and self.no_improve_epochs >= self.patience:
+                    logging.info(f"早停触发！在{self.patience}个epoch内无改进")
+                    # 保存最终状态
+                    self._save_checkpoint(
+                        epoch=epoch+1,
+                        val_acc=val_acc,
+                        val_loss=val_loss,
+                        is_latest=True
+                    )
+                    break
 
         # 保存训练历史
         history_path = os.path.join(self.exp_folder, "training_history.json")
         with open(history_path, 'w') as f:
             json.dump(self.history, f, indent=2)
+
+    def _save_checkpoint(self, epoch, val_acc=None, val_loss=None, is_best=False, is_latest=False, tag=""):
+        checkpoint = {
+            'epoch': epoch,
+            'state_dict': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'best_acc': self.best_acc,
+            'best_loss': self.best_loss,
+            'no_improve_epochs': self.no_improve_epochs,
+            'args': vars(self.args),
+            'scaler': self.scaler.state_dict()
+        }
+        
+        filename = f"checkpoint_epoch{epoch}"
+        if val_acc is not None:
+            filename += f"_acc{val_acc:.4f}"
+        if val_loss is not None:
+            filename += f"_loss{val_loss:.4f}"
+        filename += f"{tag}.pth"
+        
+        torch.save(checkpoint, os.path.join(self.args.checkpoint_dir, filename))
+        
+        if is_best:
+            best_path = os.path.join(self.args.checkpoint_dir, f"model_best_{tag}.pth")
+            torch.save(checkpoint, best_path)
+            logging.info(f"保存最佳模型：{best_path}")
+            
+        if is_latest:
+            latest_path = os.path.join(self.args.checkpoint_dir, "model_latest.pth")
+            torch.save(checkpoint, latest_path)
 
 
 if __name__ == "__main__":
