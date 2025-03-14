@@ -4,11 +4,25 @@ from models.rtNet import MultiModalFusion
 from data.dummy_loader import DummyMedicalDataset
 import argparse
 import torch.nn as nn
-from data.data_sets import get_my_data
+import logging
+# from data.data_sets import get_my_data
 import os
 import torch.nn.functional as F
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
+def setup_logging(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "train.log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train 3D ResNet")
@@ -24,6 +38,7 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, default='/data/darry/data/ESO-data', help='Data directory')
     parser.add_argument('--csv_file', type=str, default='/data/darry/data/val_set_add_train_xiugai_3_add10pos_10neg.csv', help='CSV file')
     parser.add_argument('--workers', type=int, default=2, help='Number of workers')
+    parser.add_argument('--log_dir', type=str, default='.logs', help='Log directory')
 
     # 分布式训练参数
     parser.add_argument('--distributed',type=bool,default=False,help='Distributed training')
@@ -58,6 +73,10 @@ class FocalLoss(nn.Module):
 
 def train():
     args = parse_args()
+
+    # 设置日志
+    setup_logging(args.log_dir)
+    
     # 配置参数
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = args.num_classes
@@ -70,29 +89,31 @@ def train():
     criterion = FocalLoss(gamma=2, reduction='mean')
     
     # 虚拟数据加载
-    # dataset = DummyMedicalDataset(device=device)
-    # train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataset = DummyMedicalDataset(device=device)
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # 真实数据加载
-    train_dataloader = get_my_data(args,is_train=True)
-    val_dataloader = get_my_data(args,is_train=False)
+    # train_dataloader = get_my_data(args,is_train=True)
+    # val_dataloader = get_my_data(args,is_train=False)
+    logging.info("开始训练...")
+    logging.debug("开始fefefefe训练...")
     
     # 训练循环
     for epoch in range(epochs):
         for batch in train_dataloader:
 
             # 从虚拟数据加载器中获取数据
-            # (ct, dose, structure), texts, labels = batch
-            # ct = ct.to(device)
-            # dose = dose.to(device)
-            # struct = struct.to(device)
+            (ct, dose, structure), texts, labels = batch
+            ct = ct.to(device)
+            dose = dose.to(device)
+            structure = structure.to(device)
 
             # 从真实数据加载器中获取数据
-            ct = batch['ct'].to(device=device)
-            dose = batch['dose'].to(device=device)
-            structure = batch['structure'].to(device=device)
-            texts = batch['text'].to(device=device)
-            labels = batch['label'].to(device=device)
+            # ct = batch['ct'].to(device=device)
+            # dose = batch['dose'].to(device=device)
+            # structure = batch['structure'].to(device=device)
+            # texts = batch['text'].to(device=device)
+            # labels = batch['label'].to(device=device)
             
             # 前向传播
             outputs = model(ct, dose, structure, texts)

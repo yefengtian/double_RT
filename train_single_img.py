@@ -12,7 +12,7 @@ import numpy as np
 from utils.loss import FocalLoss
 from data.data_sets import get_my_data
 import math
-# from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
@@ -70,26 +70,17 @@ def evaluate(model, dataloader, criterion, device):
     accuracy = correct / total
     return accuracy, avg_loss
 
-# 模型保存函数
-def save_checkpoint(state, is_best, save_dir, filename="checkpoint.pth"):
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(state, os.path.join(save_dir, filename))
-    if is_best:
-        best_path = os.path.join(save_dir, "model_best.pth")
-        torch.save(state, best_path)
-        logging.info(f"New best model saved at {best_path}")
-
 def parse_args():
     parser = argparse.ArgumentParser(description="3D多模态分类训练脚本")
     # 数据参数
     parser.add_argument('--data_dir', type=str, default='/data/darry/data/ESO-data')
-    parser.add_argument('--csv_file', type=str, default='/data/darry/data/val_set_add_train_xiugai_3_add10pos_10neg.csv')
+    parser.add_argument('--csv_file', type=str, default='/data/darry/data/val_set.csv')
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--target_size', type=int, default=(180, 512, 512))
     
     # 模型参数
-    parser.add_argument('--model_depth', type=int, default=50, help='ResNetb版本')
+    parser.add_argument('--model_depth', type=int, default=50, help='ResNetb版本 Depth of ResNet (10 | 18 | 34 | 50 | 101 | 152 | 200)')
     parser.add_argument('--sample_input_D', type=int, default=180, help='Depth of input samples')
     parser.add_argument('--sample_input_H', type=int, default=512, help='Height of input samples')
     parser.add_argument('--sample_input_W', type=int, default=512, help='Width of input samples')
@@ -99,15 +90,16 @@ def parse_args():
     
     # 训练参数
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--lr', type=float, default=3e-4)       # 初始学习率
-    parser.add_argument('--weight_decay', type=float, default=0.05, help='权重衰减系数')
+    parser.add_argument('--lr', type=float, default=5e-5)       # 初始学习率
+    parser.add_argument('--weight_decay', type=float, default=0.1, help='权重衰减系数')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup阶段epoch数')
-    parser.add_argument('--min_lr', type=float, default=1e-6, help='最小学习率')
+    parser.add_argument('--min_lr', type=float, default=1.0e-8, help='最小学习率')
+    # parser.add_argument('--resume', type=str, default='/data/darry/proj/double_RT/experiments/experiment_20250314_161750/checkpoints/model_latest_94.pth', help='Path to checkpoint to resume training')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training')
-    parser.add_argument('--val_interval', type=int, default=1,help='Validation interval in epochs')
-    parser.add_argument('--save_interval', type=int, default=1,help='保存最新检查点的间隔epoch数')
+    parser.add_argument('--val_interval', type=int, default=2,help='Validation interval in epochs')
+    parser.add_argument('--save_interval', type=int, default=2,help='保存最新检查点的间隔epoch数')
     parser.add_argument('--early_stop', action='store_true',help='启用早停机制')
-    parser.add_argument('--patience', type=int, default=10,help='早停等待epoch数')
+    parser.add_argument('--patience', type=int, default=20,help='早停等待epoch数')
     parser.add_argument('--amp', action='store_true',help='启用混合精度训练')
     
     # 系统参数
@@ -185,18 +177,36 @@ class Trainer:
         """从检查点恢复训练状态"""
         logging.info(f"Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
         
-        self.model.load_state_dict(checkpoint['state_dict'])
+        # 核心参数加载
+        self.model.load_state_dict(checkpoint['state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # 训练状态恢复
         self.start_epoch = checkpoint['epoch']
         self.best_acc = checkpoint['best_acc']
-
-        self.best_loss = checkpoint.get('best_loss', float('inf'))
         self.no_improve_epochs = checkpoint.get('no_improve_epochs', 0)
         
-        logging.info(f"Resumed training from epoch {self.start_epoch}")
-        logging.info(f"Previous best accuracy: {self.best_acc:.4f}")
+        # 新增组件兼容
+        if hasattr(self, 'scheduler') and 'scheduler' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # 混合精度恢复
+        if self.args.amp and 'scaler' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+        
+        # 参数合并策略
+        saved_args = checkpoint.get('args', {})
+        for k, v in saved_args.items():
+            if not hasattr(self.args, k):
+                setattr(self.args, k, v)
+        
+        # 设备同步
+        if self.args.distributed:
+            self.model = DDP(self.model, device_ids=[self.args.local_rank])
+        
+        logging.info(f"成功恢复检查点:epoch={checkpoint['epoch']},best_acc={checkpoint['best_acc']:.4f}")
 
     def _create_scheduler(self, args):
         """创建包含warmup和余弦退火的学习率调度器"""
@@ -208,8 +218,8 @@ class Trainer:
             progress = (current_epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)
             return 0.5 * (1 + math.cos(math.pi * progress)) * (1 - args.min_lr / args.lr) + args.min_lr / args.lr
 
-        # return LambdaLR(self.optimizer, lr_lambda=lr_lambda)
-        return max(args.min_lr, 0.5 * args.lr * (1 + math.cos(math.pi * progress)))
+        return LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        # return max(args.min_lr, 0.5 * args.lr * (1 + math.cos(math.pi * progress)))
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -245,7 +255,7 @@ class Trainer:
                 grad_norm = sum(p.grad.norm()**2 for p in self.model.parameters() if p.grad is not None)**0.5
                 if self.args.amp:
                     grad_norm = self.scaler.get_scale() * grad_norm  # 反缩放
-                logging.debug(f"LR: {current_lr:.2e} | Unscaled Grad Norm: {grad_norm:.4f}")
+                logging.info(f"LR: {current_lr:.2e} | Unscaled Grad Norm: {grad_norm:.4f}")
             
         
         avg_loss = epoch_loss / len(self.train_loader)
@@ -346,15 +356,17 @@ class Trainer:
             filename += f"_loss{val_loss:.4f}"
         filename += f"{tag}.pth"
         
-        torch.save(checkpoint, os.path.join(self.args.checkpoint_dir, filename))
+        os.makedirs(self.args.checkpoint_dir, exist_ok=True)
+        
+        # torch.save(checkpoint, os.path.join(self.args.checkpoint_dir, filename))
         
         if is_best:
-            best_path = os.path.join(self.args.checkpoint_dir, f"model_best_{tag}.pth")
+            best_path = os.path.join(self.args.checkpoint_dir, f"model_best_{tag}_"+filename)
             torch.save(checkpoint, best_path)
             logging.info(f"保存最佳模型：{best_path}")
             
         if is_latest:
-            latest_path = os.path.join(self.args.checkpoint_dir, "model_latest.pth")
+            latest_path = os.path.join(self.args.checkpoint_dir, f"model_latest.pth")
             torch.save(checkpoint, latest_path)
 
 
